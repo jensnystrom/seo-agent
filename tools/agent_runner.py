@@ -1,7 +1,12 @@
 """
 Agent Runner — Villalife SEO
-Kör Claude som en riktig agent med tool use.
-Claude bestämmer själv strategi, ordning och antal artiklar baserat på data.
+Claude kör som autonom agent via OpenRouter.
+
+Arkitektur:
+  - Claude använder enkla tools (GSC, WP läs, logga)
+  - Claude skriver artiklar i sin textrespons med XML-taggar
+  - Vi parsar texten och publicerar via WP API
+  - Inga stora JSON-strängar i tool calls
 
 Usage:
   python tools/agent_runner.py
@@ -10,76 +15,139 @@ Usage:
 
 import argparse
 import os
+import re
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
 
-from agent_tools import TOOL_DEFINITIONS, execute_tool
+from agent_tools import (
+    TOOL_DEFINITIONS, execute_tool,
+    publish_article, log_to_dashboard, log_published_content
+)
 
 client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url=os.getenv("OPENROUTER_BASE_URL"),
 )
 MODEL = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5")
+MAX_ITERATIONS = 25
 
-MAX_ITERATIONS = 20  # Säkerhetsgräns för agentic loop
+# Enklare tools utan publish_article (artiklar skrivs i textrespons)
+AGENT_TOOLS = [t for t in TOOL_DEFINITIONS if t["name"] not in ("publish_article", "log_published_content")]
+AGENT_TOOLS.append({
+    "name": "publish_written_article",
+    "description": "Publicerar artikeln du precis skrivit. Kalla detta DIREKT efter att du skrivit en artikel i XML-format i din respons.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "update_url": {
+                "type": "string",
+                "description": "URL till befintlig artikel att uppdatera. Tom sträng om det är en ny artikel."
+            },
+            "keyword": {
+                "type": "string",
+                "description": "Sökfrasen artikeln är optimerad för"
+            }
+        },
+        "required": ["keyword"]
+    }
+})
 
 SYSTEM_PROMPT = """Du är en autonom SEO-agent för Villalife.se — en svensk sajt om villa, hus, bostad, trädgård och renovering.
 
-Ditt uppdrag varje dag:
-1. Hämta aktuell GSC-data och analysera möjligheterna
-2. Välj de 3 artiklar/sidor med störst potential att förbättra trafik och affiliate-intäkter
-3. För quick wins och content gaps: läs befintlig artikel, skriv förbättrad version, publicera
-4. För keyword gaps: skriv ny artikel från scratch för sökfrasen
-5. Logga allt i dashboarden
+## Ditt dagliga uppdrag:
+1. Hämta GSC-data och analysera möjligheterna
+2. Välj 3 artiklar/sidor med störst potential
+3. Skriv/optimera artiklarna — DIREKT i din respons med XML-taggar
+4. Kalla publish_written_article för att publicera
+5. Logga i dashboarden
 
-Riktlinjer för innehåll:
-- Alltid svenska, naturlig ton
-- Minst 1200 ord per artikel
-- Tydliga H2/H3-rubriker med relaterade sökfraser
-- Praktiska tips och konkret information
-- SEO-optimerad titel och meta description
+## KRITISKT — Hur du skriver och publicerar en artikel:
+
+STEG 1: Skriv artikeln i din respons med dessa exakta taggar:
+<article>
+<title>Artikelns titel</title>
+<meta>SEO meta description max 155 tecken</meta>
+<slug>url-slug-pa-svenska</slug>
+<content>
+<h2>Rubrik</h2>
+<p>Innehåll...</p>
+</content>
+</article>
+
+STEG 2: Kalla OMEDELBART publish_written_article i SAMMA svar. Avsluta ALDRIG ett svar som innehåller <article>-taggar utan att kalla publish_written_article. Det är obligatoriskt.
+
+## Riktlinjer för innehåll:
+- Alltid svenska, naturlig och hjälpsam ton
+- Minst 1200 ord
+- H2/H3-rubriker med relaterade sökfraser
+- Praktiska tips, steg-för-steg, konkret info
 - Undvik keyword stuffing
 
-Prioriteringsordning:
-1. Quick wins (position 11-30) — störst chans att klättra snabbt
-2. CTR-problem — lätt att fixa, snabb effekt
-3. Content gaps (position 31-60) — kräver mer arbete men stor potential
-4. Nya artiklar för keyword gaps — bygger långsiktig trafik
+## Prioriteringsordning:
+1. Quick wins (position 11-30) — optimera befintlig
+2. CTR-problem — förbättra title/meta
+3. Content gaps (31-60) — skriv om ordentligt
+4. Keyword gaps — skriv ny artikel"""
 
-Logga varje publicerad artikel i dashboarden.
-När du är klar — summera kort vad du gjort och varför."""
+
+def extract_article_from_text(text: str) -> dict | None:
+    """Extraherar artikel från Claude's textrespons. Hanterar varianter av taggnamn."""
+    def tag(*names):
+        for name in names:
+            m = re.search(rf'<{name}[^>]*>([\s\S]*?)</{name}>', text, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        # Fallback: allt efter första matchande tag
+        for name in names:
+            m2 = re.search(rf'<{name}[^>]*>([\s\S]*)', text, re.IGNORECASE)
+            if m2:
+                return m2.group(1).strip()
+        return ""
+
+    title = tag("title")
+    content = tag("content")
+    if not title or not content:
+        return None
+    return {
+        "title": title,
+        "meta_description": tag("meta", "meta_description"),
+        "slug": tag("slug"),
+        "content": content,
+    }
 
 
 def run_agent(dry_run: bool = False) -> str:
-    """Kör Claude-agenten med full tool use. Returnerar slutsummering."""
-
     print(f"\n{'='*50}")
     print(f"VILLALIFE SEO AGENT — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*50}\n")
 
     if dry_run:
-        print("[DRY RUN] Simulerar körning utan att publicera\n")
+        print("[DRY RUN] Simulerar utan publicering\n")
 
     messages = [
         {
             "role": "user",
             "content": f"""Kör dagens SEO-arbete för Villalife.se.
 Datum: {datetime.now().strftime('%Y-%m-%d')}
-{"OBS: Detta är en dry-run. Analysera och planera men publicera INTE." if dry_run else ""}
+{"OBS: DRY RUN — analysera och planera men publicera INTE." if dry_run else ""}
 
-Börja med att hämta GSC-data, analysera situationen och beskriv kort din strategi innan du börjar."""
+Börja med att hämta GSC-data och beskriv din strategi."""
         }
     ]
 
     iteration = 0
     final_response = ""
+    pending_publish = None
+    articles_published = 0
+    planning_done = False
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
-        print(f"[Iteration {iteration}]")
+        print(f"\n[Iteration {iteration}]")
 
         response = client.chat.completions.create(
             model=MODEL,
@@ -91,18 +159,18 @@ Börja med att hämta GSC-data, analysera situationen och beskriv kort din strat
                     "description": t["description"],
                     "parameters": t["input_schema"]
                 }
-            } for t in TOOL_DEFINITIONS],
+            } for t in AGENT_TOOLS],
             tool_choice="auto",
             max_tokens=8000,
         )
 
         msg = response.choices[0]
-        finish_reason = msg.finish_reason
+        assistant_content = msg.message.content or ""
 
-        # Lägg till assistentens svar i historiken
+        # Spara assistentens textrespons i historiken
         messages.append({
             "role": "assistant",
-            "content": msg.message.content or "",
+            "content": assistant_content,
             **({"tool_calls": [
                 {
                     "id": tc.id,
@@ -113,40 +181,92 @@ Börja med att hämta GSC-data, analysera situationen och beskriv kort din strat
             ]} if msg.message.tool_calls else {})
         })
 
-        # Inga fler tool calls — agenten är klar
-        if finish_reason == "stop" or not msg.message.tool_calls:
-            final_response = msg.message.content or ""
-            print(f"\n✅ Agent klar efter {iteration} iterationer\n")
-            print(final_response)
+        # Kolla om Claude skrev en artikel i textresponsen
+        if "<article>" in assistant_content:
+            pending_publish = extract_article_from_text(assistant_content)
+            if pending_publish:
+                print(f"  📝 Artikel redo: {pending_publish['title'][:60]}")
+
+        # Klar?
+        if msg.finish_reason == "stop" or not msg.message.tool_calls:
+            # Om agenten bara planerat utan att agera — skicka follow-up
+            if articles_published == 0 and not planning_done:
+                planning_done = True
+                print(f"  (Agent planerade — skickar follow-up)")
+                messages.append({
+                    "role": "user",
+                    "content": "Bra analys! Nu kör du faktiskt arbetet. Skriv och publicera de 3 artiklarna direkt. Börja med artikel 1 nu."
+                })
+                continue
+
+            # Om en artikel är redo men inte publicerad — auto-publicera
+            if pending_publish and not dry_run:
+                print(f"  (Auto-publicerar pending artikel: {pending_publish['title'][:50]})")
+                result = publish_article(
+                    title=pending_publish["title"],
+                    content=pending_publish["content"],
+                    meta_description=pending_publish["meta_description"],
+                    slug=pending_publish["slug"],
+                )
+                print(f"  {result}")
+                if "✓" in result:
+                    articles_published += 1
+                    url = result.replace("✓ Publicerad: ", "").replace("✓ Uppdaterad: ", "").strip()
+                    log_published_content(pending_publish["title"], url, "auto-publicerad")
+                pending_publish = None
+
+            final_response = assistant_content
+            print(f"\n✅ Klar efter {iteration} iterationer ({articles_published} artiklar publicerade)")
+            if final_response:
+                print(f"\n{final_response[:500]}")
             break
 
-        # Kör verktygen
+        # Kör tool calls
         tool_results = []
-        for tool_call in msg.message.tool_calls:
-            name = tool_call.function.name
-            import json
-            args = json.loads(tool_call.function.arguments)
+        for tc in msg.message.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError as e:
+                result = f"FEL: Ogiltigt JSON i tool call: {e}"
+                tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                continue
 
-            print(f"  → Verktyg: {name}({', '.join(f'{k}={repr(v)[:50]}' for k,v in args.items())})")
+            print(f"  → {name}({', '.join(f'{k}={repr(str(v))[:50]}' for k,v in args.items())})")
 
-            if dry_run and name == "publish_article":
-                result = f"[DRY RUN] Skulle publicera: {args.get('title', '')}"
+            if name == "publish_written_article":
+                if dry_run:
+                    result = f"[DRY RUN] Skulle publicera: {pending_publish['title'] if pending_publish else 'ingen artikel redo'}"
+                elif pending_publish:
+                    result = publish_article(
+                        title=pending_publish["title"],
+                        content=pending_publish["content"],
+                        meta_description=pending_publish["meta_description"],
+                        slug=pending_publish["slug"],
+                        update_url=args.get("update_url", ""),
+                    )
+                    if "✓" in result:
+                        articles_published += 1
+                        url = result.replace("✓ Publicerad: ", "").replace("✓ Uppdaterad: ", "").strip()
+                        log_published_content(
+                            title=pending_publish["title"],
+                            url=url,
+                            keyword=args.get("keyword", ""),
+                            content_type="Optimerad" if args.get("update_url") else "Ny artikel"
+                        )
+                    pending_publish = None
+                else:
+                    result = "FEL: Ingen artikel redo att publicera. Skriv artikeln först."
             else:
                 result = execute_tool(name, args)
 
-            print(f"     {result[:100]}{'...' if len(result) > 100 else ''}")
-
-            tool_results.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result
-            })
+            print(f"     {str(result)[:100]}{'...' if len(str(result)) > 100 else ''}")
+            tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
         messages.extend(tool_results)
 
     else:
-        print(f"⚠️ Max iterationer ({MAX_ITERATIONS}) nådda")
-        final_response = "Max iterationer nådda."
+        print(f"⚠️  Max iterationer nådda")
 
     return final_response
 
@@ -155,9 +275,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-
-    result = run_agent(dry_run=args.dry_run)
-    return result
+    run_agent(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
