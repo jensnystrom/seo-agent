@@ -66,12 +66,36 @@ st.markdown("""
 
 # ── Data-hämtning ─────────────────────────────────────────────────────────────
 
+def get_credentials():
+    """Hämtar Google-credentials från Streamlit secrets eller lokal fil."""
+    try:
+        # Streamlit Cloud: credentials lagrade som secrets
+        info = {
+            "type": st.secrets["gcp"]["type"],
+            "project_id": st.secrets["gcp"]["project_id"],
+            "private_key_id": st.secrets["gcp"]["private_key_id"],
+            "private_key": st.secrets["gcp"]["private_key"],
+            "client_email": st.secrets["gcp"]["client_email"],
+            "client_id": st.secrets["gcp"]["client_id"],
+            "auth_uri": st.secrets["gcp"]["auth_uri"],
+            "token_uri": st.secrets["gcp"]["token_uri"],
+            "auth_provider_x509_cert_url": st.secrets["gcp"]["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": st.secrets["gcp"]["client_x509_cert_url"],
+            "universe_domain": "googleapis.com",
+        }
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+    except (KeyError, FileNotFoundError):
+        # Lokal utveckling: läs från fil
+        return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
+
 @st.cache_data(ttl=300)  # Cache 5 min
 def load_sheet_data():
     try:
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        sheet_id = SHEET_ID or st.secrets.get("GOOGLE_SHEET_ID", "")
+        creds = get_credentials()
         client = gspread.authorize(creds)
-        sh = client.open_by_key(SHEET_ID)
+        sh = client.open_by_key(sheet_id)
 
         data = {}
         for ws in sh.worksheets():
