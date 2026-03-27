@@ -37,16 +37,13 @@ secrets = modal.Secret.from_name("villalife-secrets")
     timeout=1800,
 )
 def run_daily():
-    """Daglig körning — hämtar GSC, auditerar, skriver artiklar."""
+    """Daglig körning — Claude agent med full tool use."""
     os.chdir("/app")
     sys.path.insert(0, "/app/tools")
-
-    # Sätt env vars som förväntas av tools
     os.environ.setdefault("GSC_SERVICE_ACCOUNT_FILE", "/app/credentials/gsc_service_account.json")
 
-    from orchestrator import main as orchestrator_main
-    sys.argv = ["orchestrator.py"]
-    orchestrator_main()
+    from agent_runner import run_agent
+    run_agent(dry_run=False)
 
 
 @app.function(
