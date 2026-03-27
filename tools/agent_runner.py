@@ -39,17 +39,20 @@ MAX_ITERATIONS = 25
 AGENT_TOOLS = [t for t in TOOL_DEFINITIONS if t["name"] not in ("publish_article", "log_published_content")]
 AGENT_TOOLS.append({
     "name": "publish_written_article",
-    "description": "Publicerar artikeln du precis skrivit. Kalla detta DIREKT efter att du skrivit en artikel i XML-format i din respons.",
+    "description": "Publicerar artikeln du precis skrivit i XML-format. Kalla DIREKT efter <article>-taggar.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "update_url": {
-                "type": "string",
-                "description": "URL till befintlig artikel att uppdatera. Tom sträng om det är en ny artikel."
+            "keyword": {"type": "string", "description": "Sökfrasen artikeln är optimerad för"},
+            "update_url": {"type": "string", "description": "URL till befintlig artikel att uppdatera. Tom om ny."},
+            "category_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Lista med WordPress kategori-ID:n från get_wp_categories"
             },
-            "keyword": {
-                "type": "string",
-                "description": "Sökfrasen artikeln är optimerad för"
+            "featured_media_id": {
+                "type": "integer",
+                "description": "Media ID från generate_and_upload_image"
             }
         },
         "required": ["keyword"]
@@ -58,40 +61,45 @@ AGENT_TOOLS.append({
 
 SYSTEM_PROMPT = """Du är en autonom SEO-agent för Villalife.se — en svensk sajt om villa, hus, bostad, trädgård och renovering.
 
-## Ditt dagliga uppdrag:
-1. Hämta GSC-data och analysera möjligheterna
-2. Välj 3 artiklar/sidor med störst potential
-3. Skriv/optimera artiklarna — DIREKT i din respons med XML-taggar
-4. Kalla publish_written_article för att publicera
-5. Logga i dashboarden
+## Ditt dagliga uppdrag per artikel:
+1. Hämta GSC-data och välj 3 artiklar med störst potential
+2. Hämta WordPress-kategorier (get_wp_categories)
+3. Generera bild med Grok (generate_and_upload_image)
+4. Skriv artikeln i din respons med XML-taggar
+5. Kalla publish_written_article med kategori-ID och media-ID
+6. Logga i dashboarden
 
-## KRITISKT — Hur du skriver och publicerar en artikel:
+## KRITISKT — Så här skriver och publicerar du:
 
-STEG 1: Skriv artikeln i din respons med dessa exakta taggar:
+STEG 1: Generera bild och hämta kategorier (tool calls)
+
+STEG 2: Skriv artikeln med dessa exakta taggar:
 <article>
 <title>Artikelns titel</title>
 <meta>SEO meta description max 155 tecken</meta>
 <slug>url-slug-pa-svenska</slug>
 <content>
 <h2>Rubrik</h2>
-<p>Innehåll...</p>
+<p>Innehåll med <a href="/relaterad-artikel">internlänk</a> och <a href="https://extern.se" rel="nofollow">externlänk</a>...</p>
 </content>
 </article>
 
-STEG 2: Kalla OMEDELBART publish_written_article i SAMMA svar. Avsluta ALDRIG ett svar som innehåller <article>-taggar utan att kalla publish_written_article. Det är obligatoriskt.
+STEG 3: Kalla OMEDELBART publish_written_article med category_id och featured_media_id.
+Avsluta ALDRIG ett svar med <article>-taggar utan att kalla publish_written_article.
 
 ## Riktlinjer för innehåll:
-- Alltid svenska, naturlig och hjälpsam ton
-- Minst 1200 ord
+- Svenska, naturlig och hjälpsam ton, minst 1200 ord
 - H2/H3-rubriker med relaterade sökfraser
-- Praktiska tips, steg-för-steg, konkret info
+- Minst 2-3 internlänkar till andra sidor på villalife.se
+- Minst 1 externlänk till auktoritativ källa (rel="nofollow")
+- Praktiska tips och konkret information
 - Undvik keyword stuffing
 
 ## Prioriteringsordning:
-1. Quick wins (position 11-30) — optimera befintlig
-2. CTR-problem — förbättra title/meta
-3. Content gaps (31-60) — skriv om ordentligt
-4. Keyword gaps — skriv ny artikel"""
+1. Quick wins (position 11-30)
+2. CTR-problem
+3. Content gaps (31-60)
+4. Keyword gaps — nya artiklar"""
 
 
 def extract_article_from_text(text: str) -> dict | None:
@@ -244,6 +252,8 @@ Börja med att hämta GSC-data och beskriv din strategi."""
                         meta_description=pending_publish["meta_description"],
                         slug=pending_publish["slug"],
                         update_url=args.get("update_url", ""),
+                        category_ids=args.get("category_ids", []),
+                        featured_media_id=args.get("featured_media_id", 0),
                     )
                     if "✓" in result:
                         articles_published += 1

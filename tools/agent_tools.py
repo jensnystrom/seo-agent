@@ -18,6 +18,7 @@ WP_USERNAME = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "").replace(" ", "")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GSC_SERVICE_ACCOUNT_FILE = os.getenv("GSC_SERVICE_ACCOUNT_FILE")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
 GSC_SITE_URL = os.getenv("GSC_SITE_URL")
 
 
@@ -148,10 +149,10 @@ def get_post_content(url: str) -> str:
 
 
 def publish_article(title: str, content: str, meta_description: str,
-                    slug: str, update_url: str = "") -> str:
+                    slug: str, update_url: str = "",
+                    category_ids: list = None, featured_media_id: int = 0) -> str:
     """
     Publicerar eller uppdaterar en artikel på WordPress.
-    Om update_url anges uppdateras den befintliga artikeln, annars skapas ny.
     """
     try:
         auth = (WP_USERNAME, WP_APP_PASSWORD)
@@ -160,8 +161,12 @@ def publish_article(title: str, content: str, meta_description: str,
             "content": content,
             "status": "publish",
             "slug": slug,
-            "meta": {"_yoast_wpseo_metadesc": meta_description}
+            "meta": {"_yoast_wpseo_metadesc": meta_description},
         }
+        if category_ids:
+            payload["categories"] = category_ids
+        if featured_media_id:
+            payload["featured_media"] = featured_media_id
 
         if update_url:
             slug_from_url = update_url.rstrip("/").split("/")[-1]
@@ -238,6 +243,66 @@ def log_published_content(title: str, url: str, keyword: str,
         return f"FEL: {e}"
 
 
+# ── Bildgenerering ────────────────────────────────────────────────────────────
+
+def generate_and_upload_image(prompt: str, article_title: str) -> str:
+    """
+    Genererar en bild via Grok API och laddar upp till WordPress.
+    Returnerar WordPress media ID och URL.
+    """
+    try:
+        # Generera bild via Grok
+        resp = requests.post(
+            "https://api.x.ai/v1/images/generations",
+            headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "grok-imagine-image",
+                "prompt": f"{prompt}. Photorealistic, professional, Swedish villa and home context.",
+                "n": 1,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        image_url = resp.json()["data"][0]["url"]
+
+        # Ladda ner bilden
+        img_data = requests.get(image_url, timeout=30).content
+        slug = re.sub(r'[^a-z0-9]+', '-', article_title.lower())[:50]
+        filename = f"{slug}.jpg"
+
+        # Ladda upp till WordPress media library
+        auth = (WP_USERNAME, WP_APP_PASSWORD)
+        upload_resp = requests.post(
+            f"{WP_URL}/wp-json/wp/v2/media",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type": "image/jpeg",
+            },
+            data=img_data,
+            auth=auth,
+            timeout=30,
+        )
+        upload_resp.raise_for_status()
+        media = upload_resp.json()
+        return json.dumps({"id": media["id"], "url": media["source_url"]})
+
+    except Exception as e:
+        return f"FEL vid bildgenerering: {e}"
+
+
+# ── WordPress kategorier ───────────────────────────────────────────────────────
+
+def get_wp_categories() -> str:
+    """Hämtar alla WordPress-kategorier med ID och namn."""
+    try:
+        resp = requests.get(f"{WP_URL}/wp-json/wp/v2/categories?per_page=100", timeout=15)
+        cats = resp.json()
+        result = [{"id": c["id"], "name": c["name"], "slug": c["slug"]} for c in cats]
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return f"FEL: {e}"
+
+
 # ── Tool-definitioner för Anthropic API ──────────────────────────────────────
 
 TOOL_DEFINITIONS = [
@@ -308,6 +373,23 @@ TOOL_DEFINITIONS = [
             },
             "required": ["title", "url", "keyword"]
         }
+    },
+    {
+        "name": "get_wp_categories",
+        "description": "Hämtar alla WordPress-kategorier med ID och namn. Kalla detta innan du publicerar för att välja rätt kategori-ID.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "generate_and_upload_image",
+        "description": "Genererar en relevant bild med Grok AI och laddar upp till WordPress. Returnerar media ID och URL. Kalla detta för varje artikel för att skapa en featured image.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Bildprompt på engelska, beskriv vad bilden ska föreställa"},
+                "article_title": {"type": "string", "description": "Artikelns titel — används som filnamn"}
+            },
+            "required": ["prompt", "article_title"]
+        }
     }
 ]
 
@@ -320,6 +402,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         "publish_article": publish_article,
         "log_to_dashboard": log_to_dashboard,
         "log_published_content": log_published_content,
+        "get_wp_categories": get_wp_categories,
+        "generate_and_upload_image": generate_and_upload_image,
     }
     fn = tools_map.get(tool_name)
     if not fn:
